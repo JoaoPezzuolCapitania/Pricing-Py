@@ -8,41 +8,102 @@ replicando bit-a-bit o comportamento da função VBA `fPricing(ativo, data, pu, 
 
 ---
 
-## Status atual (2026-04-14, comparação COM direta, 318 ativos)
+## Status atual (2026-04-28, comparação PROD vs HML, dia 2026-04-24, 1047 ativos)
 
-### Taxa (yield)
+### Resumo PROD (VBA `PricingRFE.xlam`) vs HML (`pricing_engine` Python)
 
-| Métrica Taxa          | Valor              |
-|-----------------------|--------------------|
-| Match exato (<=1e-6)  | 303/318 (95.3%)    |
-| Diff < 0.0001         | 314/318 (98.7%)    |
-| Diff < 0.001          | 317/318 (99.7%)    |
+| Métrica   | Match exato (<=1e-6) | Diff < 1e-4    | Diff < 5e-4    | Diff < 1e-3    |
+|-----------|----------------------|-----------------|-----------------|-----------------|
+| taxa      | 1021/1047 (97,52%)   | 1031 (98,47%)  | 1042 (99,43%)  | 1043 (99,52%)  |
+| spread    | 1025/1047 (97,90%)   | 1031 (98,47%)  | 1037 (98,95%)  | 1038 (99,04%)  |
+| duration  | 1030/1047 (98,38%)   | 1038 (99,14%)  | 1038 (99,14%)  | 1038 (99,14%)  |
+| overtp    | 833/1047 (79,56%)    | 1026 (97,99%)  | 1042 (99,43%)  | 1043 (99,52%)  |
 
-### Duration
+**Match nas 4 métricas batendo TODAS (até 1e-3):** 1033/1047 = **98,66%**.
+Excluindo `4083221SN1` (distressed): **1033/1042 = 99,14%**.
 
-| Métrica Duration      | Valor              |
-|-----------------------|--------------------|
-| Match exato (<=1e-6)  | 304/318 (95.6%)    |
-| Diff < 0.0001         | 307/318 (96.5%)    |
-| Diff < 0.001          | 309/318 (97.2%)    |
+### Planilhas de comparação
 
-### Distribuição de outliers por indexador
+- `X:\BDM\CRI\Comparativo_PROD_vs_HML_20260424.xlsx` — todas as linhas, ordem alfabética
+- `X:\BDM\CRI\Comparativo_PROD_vs_HML_20260424_ordenado.xlsx` — ordenado por maior diff no topo
 
-| Indexador | Exact | Com diff |
-|-----------|-------|----------|
-| CDI +     | 150   | 12       |
-| IPCA +    | 147   | 2 (tiny) |
-| % CDI     | 2     | 0        |
-| Pré       | 5     | 0        |
+---
 
-### Planilha de comparação
+## Patch aplicado (sessão 2026-04-28)
 
-`X:\BDM\CRI\Comparativo_Python_vs_VBA_20260326.xlsx` — 318 ativos com colunas:
-Ativo, PU, Taxa PY/VBA/Diff, Spread PY/VBA/Diff, Duration PY/VBA/Diff, OverTP PY/VBA/Diff
+### Patch 1 — `dAccInflFactor` persistente
+
+**Problema:** o VBA `fGetFuture` mantém `tCalc.dAccInflFactor` GLOBAL entre chamadas de `fPricing`. Bonds com `sAMmonth` setado (IPCA+ com lag, ex: 19L0840477, 20L0687041) acumulam estado neste campo. PROD é gerado em batch — múltiplas chamadas seguidas — então herda esse estado entre bonds.
+
+Antes do patch, Python resetava `dAccInflFactor = 0` a cada chamada (default da dataclass `CalcParams`). Resultado: 25 bonds IPCA+ com diff sistemática de ~0,022 no spread.
+
+**Mudanças:**
+
+1. **`bond.py:_get_future`** (linha 391-398): para períodos passados, retorna `1.0` direto sem mexer em `dAccInflFactor`. Antes Python tinha um bloco extra que rodava a acumulação para datas passadas — VBA não faz isso (sai com `Exit Function`).
+2. **`fpricing.py`**: adicionado `_PERSISTENT_STATE = {'dAccInflFactor': 0.0}` módulo-level. `fPricing` lê esse valor antes de `run_payments` e salva o valor final ao retornar. Replica o comportamento do VBA onde `tCalc.dAccInflFactor` persiste entre chamadas.
+3. **`fpricing.py`**: exposta `reset_persistent_state()` para resetar manualmente em testes.
+
+**Impacto:** spread foi de 96,0% → 97,9% match exato, sem regressões em outras métricas. Net +25 ativos.
+
+---
+
+## Divergências remanescentes (14 bonds, dia 2026-04-24)
+
+Investigação detalhada validou que **Python = VBA `PricingRFE.xlam` fresh** para esses bonds (testado via COM direta). O PROD difere por motivos externos ao motor.
+
+### `4083221SN1` (5 linhas) — Distressed FIDC, yield ~190%
+- PROD: yield = 1,990482 — gerado pela `RFE Pricing 3.0.xlsm` (calculadora SEPARADA) usada manualmente
+- VBA `PricingRFE` fresh = Python = 1,910744 (Newton-Raphson)
+- A função PV(yield) é flat entre 1,91 e 1,99 — múltiplos yields satisfazem PV ≈ PU
+- Implementar a bisseção da RFE 3.0 em Python NÃO resolve (Python converge a 1,910760, RFE 3.0 a 1,990481, divergência por precisão Double específica do VBA)
+- **Sem fix viável** sem replicar bit-a-bit o caminho de iteração VBA
+
+### `AGIZ11` (4 linhas) — IPCA+ Debênture
+- PROD: 0,077890; VBA fresh = Python = 0,077591
+- `AGIZ11.txt` foi modificado em 2026-04-28 11:05 (MESMO DIA da nossa investigação)
+- PROD foi gerado ANTES dessa modificação, com versão antiga do .txt
+- **Causa: input mudou após geração do PROD** (não é bug do motor)
+
+### `ALGTA4` (3 linhas) e `CASN23` (2 linhas) — IPCA+ Debênture
+- PROD: ALGTA4=0,082733, CASN23=0,080740
+- VBA fresh = Python = ALGTA4=0,083037, CASN23=0,081040
+- **TODAS as 3 calculadoras** (PricingRFE, RFE 3.0, Python) dão o MESMO valor — só PROD difere
+- `.txt` desses bonds não foi modificado recentemente
+- **Origem do valor PROD desconhecida** — provavelmente outra calculadora manual ou edição direta no banco
+
+---
+
+## Calculadoras VBA paralelas (descobertas durante investigação)
+
+Existem múltiplos engines de pricing convivendo:
+
+1. **`C:\Add-in\Oficial\PricingRFE.xlam`** — addin oficial. Usado pelo `workflow_pricings.py` automático.
+   - Algoritmo: Newton-Raphson clássico
+   - Convergência: `Round(dPrice, 6) == Round(dPU, 6)`
+2. **`X:\#CapitaniaRFE\Trading\Pricing\Operacional\RFE Pricing 3.0.xlsm`** — calculadora interativa.
+   - Algoritmo: bisseção adaptativa (`dStart` halve em sign change)
+   - Convergência: `Abs(dError) <= calc.dError` (tolerância absoluta dependente de PU)
+   - Usada manualmente para distressed (ex: 4083221SN1)
+3. **`X:\#CapitaniaRFE\Trading\Pricing\Calculadora FIDC CDI.xlsm`** — variante para FIDCs.
+
+Para bonds normais, todas as calculadoras convergem ao mesmo ponto. Para distressed (yield extrema, função flat), divergem.
 
 ---
 
 ## Bugs corrigidos (histórico completo)
+
+### Sessão 2026-04-28
+
+1. **`_get_future` rodava acumulação para datas passadas** — `bond.py:391-411` tinha bloco
+   especial que mexia em `dAccInflFactor` para `dt_to <= calc.dtDay`. VBA `fGetFuture`
+   sai com `Exit Function` para datas passadas SEM tocar em `dAccInflFactor`. Removido.
+   **Impacto**: parte do fix do spread IPCA+ (combinado com #2 abaixo).
+
+2. **`dAccInflFactor` resetado a cada `fPricing`** — Python criava nova `CalcParams` por
+   chamada (default 0.0). VBA mantém `tCalc.dAccInflFactor` global entre chamadas.
+   Adicionado `_PERSISTENT_STATE` módulo-level em `fpricing.py` que persiste o valor
+   entre chamadas, replicando o comportamento do VBA.
+   **Impacto**: spread foi de 96,0% → 97,9% match exato (+25 ativos IPCA+ com sAMmonth).
 
 ### Sessão 2026-04-14
 
@@ -74,62 +135,38 @@ Ativo, PU, Taxa PY/VBA/Diff, Spread PY/VBA/Diff, Duration PY/VBA/Diff, OverTP PY
 
 ---
 
-## Investigação em andamento: Duration CDI+ (12 outliers)
+## Tentativa abandonada: bisseção do RFE 3.0 para distressed (2026-04-28)
 
-### O problema
+Tentei replicar o solver de bisseção do `RFE Pricing 3.0.xlsm` em Python para tentar bater
+o `4083221SN1` (yield 1,99 no PROD vs 1,91 no Python).
 
-12 bonds CDI+ têm duration Python **sempre menor** que VBA. A diferença NÃO vem da yield
-(testado usando a yield exata do VBA → duration continua diferindo). O problema está na
-**distribuição dos `dPVpmtCalc`** por período.
+**Implementação:**
+```python
+def get_taxa_bisection(calc, bond, periods, pbs, results):
+    d_y = bond.dYield
+    d_error = bond.dPU
+    d_start = 1.0
+    while abs(d_error) > calc.dError:
+        d_price = sum(pv_calc(i, d_y, ...) for i in periods)
+        if d_error * (d_price - calc.dPU) < 0:
+            d_start /= 2
+        d_error = d_price - calc.dPU
+        d_mult = d_start * abs(d_error / calc.dPU)
+        if d_error > 0: d_y += d_mult
+        else: d_y -= d_mult
+```
 
-### O que já foi verificado
+**Resultado:** Python bisseção converge a 1,910760 (basicamente igual ao Newton-Raphson).
+NÃO bate com o 1,990481 do RFE 3.0 real.
 
-- Fórmula `sDuration` do VBA vs `duration()` Python: **IDÊNTICAS**
-- Fórmula `sPvCalc` vs `pv_calc`: **IDÊNTICAS**
-- Fórmula `fGetSpread` vs `fGetSpread`: **IDÊNTICAS**
-- Fórmula `fGetFuture` (DI1) vs `_get_future`: **IDÊNTICAS**
-- DI1 curve lookups para BBML13 (63 períodos): **TODOS BATEM**
-- `brworkdays` para todos os pares de período de BBML13: **TODOS BATEM**
-- Fluxo `sGetTaxa` → `sDuration` no VBA vs `get_taxa` → `duration` no Python: **MESMO FLUXO**
-- `sGetSpreadYield` (chamado dentro de `sGetTaxa`) usa `fGetPrice("Spread")` que modifica
-  `dPVpmtSpread` e NÃO `dPVpmtCalc` → duration não é afetada
+**Por quê:** a função `PV(yield) - PU` é completamente flat entre 1,91 e 1,99 para esse
+bond (yield extrema, função mal-condicionada). Múltiplos yields são "soluções" válidas.
+Newton-Raphson e bisseção convergem em pontos diferentes da faixa flat. O VBA do RFE 3.0
+termina em 1,99 por idiossincrasias da precisão Double do VB Office — não dá pra
+replicar bit-a-bit em Python.
 
-### Hipótese atual
-
-A cadeia `dPVfactorCalc[i] = dPVfactorCalc[i-1] * fGetSpread(yield) * dYdi1[i]` acumula uma
-diferença microscópica nos fatores DI1 ou CDI que se amplifica ao longo de muitos períodos.
-Mesmo que PU total bata (Newton-Raphson ajusta yield para isso), a distribuição de PVpmtCalc
-entre períodos difere, causando um weighted average (duration) diferente.
-
-### Top 6 maiores outliers
-
-| Ativo       | Dur PY    | Dur VBA   | Diff      |
-|-------------|-----------|-----------|-----------|
-| LCAMC2      | 2.982798  | 3.237431  | -0.254633 |
-| 22L1212138  | 3.113936  | 3.141400  | -0.027464 |
-| 5483424UN1  | 3.065510  | 3.092634  | -0.027124 |
-| 6039625SR1  | 5.676398  | 5.694390  | -0.017992 |
-| 6083125SR1  | 1.846871  | 1.862805  | -0.015934 |
-| 5241224SR3  | 1.771320  | 1.784846  | -0.013526 |
-
-### Próximo passo
-
-Extrair os `dPVpmtCalc` per-período do VBA via COM para comparação direta.
-A injeção de macro (`VBProject.VBComponents.Add`) requer "Trust access to VBA project
-object model" habilitado no Excel. Alternativa: escrever macro standalone no VBA que
-exporta dados para arquivo texto.
-
----
-
-## BBML13 — investigação detalhada (deprioritizado)
-
-Bond CDI+ com IncorpYield + StepUp. PU bate exato, mas duration difere por ~0.006 e
-taxa difere por ~0.030. Investigação extensiva feita sem encontrar root cause:
-- Todas as fórmulas idênticas ao VBA
-- DI1 lookups todos batem
-- brworkdays todos batem
-- Outros bonds CDI+ com IncorpYield+StepUp (19E0322333, 22K0640841) batem perfeitamente
-- Causa provavelmente é a mesma dos 12 outliers CDI+ (acúmulo na cadeia PV)
+Patch revertido. Código removido. **Não é fixável sem replicar o caminho de iteração
+exato do VBA, incluindo numeric subtleties do VB Office.**
 
 ---
 
@@ -311,6 +348,7 @@ df_result = fPricing_batch(df, '2026-03-27', inp=2, curves=curves)
 
 ```
 fPricing(ativo, dt, value, inp, out)
+  ├── _PERSISTENT_STATE.read     ← restaura dAccInflFactor da chamada anterior
   ├── load_curves(dt)            ← carrega DI1, IPCA, IGPM, CDI, AM
   ├── load_bond(ativo, dt)       ← carrega BondInfo, CalcParams, PeriodInfo[]
   ├── _setup_calc(inp, value)    ← configura tipo: PU, Yield, Spread, %PUPar
@@ -318,6 +356,7 @@ fPricing(ativo, dt, value, inp, out)
   ├── run_payments(bond, calc, periods, curves)
   │     ├── _load_yield(i)       ← yield com step-up (dicYields)
   │     ├── _calc_yield(i)       ← dYcdi, dYdi1, dYspread, dYtotal
+  │     │   └── _get_future()    ← LE/ESCREVE calc.dAccInflFactor (estado!)
   │     ├── _incorporated_yield(i) ← ajuste IncorpYield (se bAmort100)
   │     ├── _calc_am(i)          ← dFatAm, dFatAmAcc, dSNA
   │     ├── _calc_pmt(i)         ← dPMTJuros, dPMTAmort, dPMTTotal
@@ -327,8 +366,15 @@ fPricing(ativo, dt, value, inp, out)
   │     ├── get_price(yield, "Taxa") → pv_calc() → dPVpmtCalc
   │     └── get_spread_yield()   ← Newton-Raphson: PU → spread
   ├── [Duration out] duration()  ← sum(dPVpmtCalc * days) / price / 252
-  └── get_over_tp_with_curves()  ← spread sobre benchmark
+  ├── get_over_tp_with_curves()  ← spread sobre benchmark
+  └── _PERSISTENT_STATE.write    ← persiste dAccInflFactor para próxima chamada
 ```
+
+**Importante:** `_PERSISTENT_STATE` é módulo-level em `fpricing.py`. Replica
+`tCalc.dAccInflFactor` global do VBA. Só fica diferente de zero para bonds com
+`sAMmonth` setado (IPCA+ com lag mensal). Para bonds sem `sAMmonth`, é sempre 0.0
+(efeito nulo). Use `reset_persistent_state()` no início de workflow novo se quiser
+estado limpo.
 
 ---
 
@@ -375,6 +421,7 @@ openpyxl         ← leitura/escrita de Excel
 ## Notas importantes
 
 - **Servidor PROD**: `rds01.capitania.net`, database `db_asset_carteiras`
+- **Servidor HML**: `s14-db-hml.cb6sndi8pxjt.sa-east-1.rds.amazonaws.com`
 - **Calendário VBA**: carregado de `FeriadosAddin.xlam` → 908 feriados (1994-2078)
   - Calendário Python estendido até 2100 (sem feriados após 2078, apenas weekends)
 - **Formato datas nos arquivos .txt**: MM/DD/YYYY, DD/MM/YYYY, ou YYYY-MM-DD
@@ -386,3 +433,26 @@ openpyxl         ← leitura/escrita de Excel
 - **VBA `sPricing` (sub)** difere de `fPricing` (function): `sPricing` sempre roda
   `sGetTaxa → sDuration → sGetSpreadYield`, enquanto `fPricing` é condicional.
   A comparação COM usa `sPricing` + `fResult`.
+
+## Como rodar o workflow oficial
+
+```powershell
+cd X:\BDM\CRI
+python -m pricing_engine.run_pricing_hml 2026-04-24
+```
+
+- Lê `Renda_Fixa_Carteiras` do PROD (rds01).
+- Aplica `read_carteiras_rf` (filtros, dedup por chave).
+- Chama `fPricing` para cada bond (4 métricas: taxa, spread, duration, overtp).
+- Salva em `Chaves_Pricing` no HML (s14-db-hml).
+
+## Comparar HML vs PROD
+
+Use os Excel gerados:
+- `X:\BDM\CRI\Comparativo_PROD_vs_HML_20260424.xlsx`
+- `X:\BDM\CRI\Comparativo_PROD_vs_HML_20260424_ordenado.xlsx`
+
+Cores:
+- 🟢 verde: diff <= 1e-4
+- 🟡 amarelo: 1e-4 < diff <= 1e-3
+- 🔴 vermelho: diff > 1e-3

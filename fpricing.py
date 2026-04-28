@@ -96,6 +96,17 @@ def _get_result(i_result, results):
     return None
 
 
+# State global de tCalc.dAccInflFactor — replica o comportamento do VBA, onde
+# tCalc é módulo-level e dAccInflFactor persiste entre chamadas de fPricing.
+# Necessário pra bonds com sAMmonth: workflow batch (PROD) ativa essa pollution.
+_PERSISTENT_STATE = {'dAccInflFactor': 0.0}
+
+
+def reset_persistent_state():
+    """Reseta o estado global. Use no início de cada workflow novo."""
+    _PERSISTENT_STATE['dAccInflFactor'] = 0.0
+
+
 def fPricing(s_bond, dt_day, d_value, i_info, i_result, curves=None):
     """
     Réplica exata do fPricing do VBA.
@@ -124,6 +135,9 @@ def fPricing(s_bond, dt_day, d_value, i_info, i_result, curves=None):
         return "Ativo não cadastrado!"
 
     bond, calc, periods = result
+
+    # Restaurar dAccInflFactor da chamada anterior (replica state global do VBA)
+    calc.dAccInflFactor = _PERSISTENT_STATE['dAccInflFactor']
 
     # Configurar cálculo
     _setup_calc(calc, i_info, d_value, bond)
@@ -159,6 +173,9 @@ def fPricing(s_bond, dt_day, d_value, i_info, i_result, curves=None):
             get_taxa(calc, bond, periods, pbs, results)
         duration(calc, bond, periods, pbs, results)
         get_over_tp_with_curves(calc, bond, results, curves)
+
+    # Persistir dAccInflFactor pra proxima chamada (replica state global do VBA)
+    _PERSISTENT_STATE['dAccInflFactor'] = calc.dAccInflFactor
 
     return _get_result(i_result, results)
 

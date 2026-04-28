@@ -394,21 +394,8 @@ def _get_future(dt_from, dt_to, s_curve, calc, bond, curves):
     dt_to = _to_date(dt_to)
 
     if dt_to <= calc.dtDay:
-        # Para bonds com sAMmonth, precisa rodar o mecanismo de acumulacao
-        # mesmo para periodos passados (VBA acumula via dAccInflFactor)
-        if calc.sAMmonth and s_curve not in ("CDI", "DI1", "Pré") and '+' in s_curve:
-            result = 1.0
-            if am_month_check(calc.sAMmonth, dt_to) != 0:
-                if calc.dAccInflFactor != 0:
-                    result = calc.dAccInflFactor * result
-                calc.dAccInflFactor = 1.0
-            else:
-                if calc.dAccInflFactor == 0:
-                    calc.dAccInflFactor = result
-                else:
-                    calc.dAccInflFactor *= result
-                result = 1.0
-            return result
+        # VBA fGetFuture: para periodos passados, retorna 1 SEM mexer em dAccInflFactor.
+        # (codigo anterior acumulava aqui — divergia do VBA)
         return 1.0
 
     d_am = 1.0
